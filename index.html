@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light only">
+  <meta name="robots" content="noindex,nofollow">
+  <title>수빈이에게 · 채티의 스케치북</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- 마감 시점의 스케치북을 담은 정적 페이지입니다. 열릴 때 서버에서 그 뒤에 올라온 새 글만 이어 붙입니다(실패해도 담아 둔 글은 그대로 보입니다). -->
+  <div class="stage-book">
+    <div class="book">
+      <div id="page"></div>
+      <div class="pager">
+        <button class="btn" id="prev" type="button">← 이전</button>
+        <span class="muted" id="count"></span>
+        <button class="btn primary" id="next" type="button">다음 →</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/api.js"></script>
+  <script src="data.js"></script>
+  <script>
+    (function () {
+      const B = window.BOOK || { entries: [] };
+      const root = document.getElementById("page");
+      const prev = document.getElementById("prev");
+      const next = document.getElementById("next");
+      const count = document.getElementById("count");
+
+      let pages = [{ kind: "cover" }, ...B.entries.map((e) => ({ kind: "sketch", e })), { kind: "end" }];
+      let i = 0;
+
+      // ───── 마감 뒤에 올라온 글을 서버에서 이어 붙입니다 ─────
+      // 담아 둔 글은 서버 사정과 상관없이 항상 남습니다. 새 글은 뒤에 붙고, 담은 뒤에 고친 글은 고친 내용으로 바뀝니다.
+      const maskName = (n) => (n.length <= 1 ? n : n.length === 2 ? n[0] + "○" : n[0] + "○".repeat(n.length - 2) + n[n.length - 1]);
+      const liveEntry = (r) => {
+        const name = (r.name || "").trim();
+        return { id: r.id, updated_at: r.updated_at, live: true, hasImage: true,
+          name: B.maskAll || (B.maskNames || []).includes(name) ? maskName(name) : name, message: (r.message || "").trim() };
+      };
+      function mergeLive(rows) {
+        const live = new Map(rows.map((r) => [r.id, r]));
+        const known = new Set(B.entries.map((e) => e.id).filter(Boolean));
+        const out = B.entries.map((e) => {
+          const r = e.id && live.get(e.id);
+          return r && r.updated_at !== e.updated_at ? liveEntry(r) : e;
+        });
+        rows.forEach((r) => {
+          if (known.has(r.id) || (B.excludeNames || []).includes((r.name || "").trim())) return;
+          out.push(liveEntry(r));
+        });
+        return out;
+      }
+      let sig = "";
+      async function syncLive() {
+        try {
+          const rows = await API.listSketchMeta();
+          const entries = mergeLive(rows);
+          const s = entries.map((e) => (e.id || "") + (e.updated_at || "")).join("|");
+          if (s === sig) return;
+          sig = s;
+          const cur = pages[i] && pages[i].e ? pages[i].e.id : null;
+          const kind = pages[i] ? pages[i].kind : "cover";
+          pages = [{ kind: "cover" }, ...entries.map((e) => ({ kind: "sketch", e })), { kind: "end" }];
+          if (cur) { const k = pages.findIndex((p) => p.e && p.e.id === cur); i = k >= 0 ? k : 0; }
+          else i = kind === "end" ? pages.length - 1 : Math.min(i, pages.length - 1);
+          if (!first) show();
+        } catch (e) { console.warn("새 글을 가져오지 못했어요", e); }
+      }
+      let first = true;
+
+      function el(tag, cls, text) {
+        const n = document.createElement(tag);
+        if (cls) n.className = cls;
+        if (text !== undefined) n.textContent = text;
+        return n;
+      }
+
+      // 이미지는 조각(원래이름.p000, .p001 ...)으로 나뉘어 올라가 있어서, 조각을 모두 받아 하나로 합칩니다.
+      // 같은 이미지는 한 번만 받고, 받은 결과를 다시 씁니다.
+      const cache = new Map();
+      function loadImage(spec) {
+        if (!spec) return Promise.resolve(null);
+        if (cache.has(spec.src)) return cache.get(spec.src);
+        const v = encodeURIComponent(B.version || "");
+        const tasks = [];
+        for (let k = 0; k < spec.parts; k++) {
+          const url = spec.src + ".p" + String(k).padStart(3, "0") + "?v=" + v;
+          tasks.push(fetch(url).then((r) => { if (!r.ok) throw new Error(url + " " + r.status); return r.arrayBuffer(); }));
+        }
+        const p = Promise.all(tasks)
+          .then((bufs) => URL.createObjectURL(new Blob(bufs, { type: spec.mime })))
+          .catch((e) => { console.warn(e); cache.delete(spec.src); return null; });
+        cache.set(spec.src, p);
+        return p;
+      }
+
+      function show() {
+        const p = pages[i];
+        const page = el("div", "page" + (p.kind === "cover" ? " cover" : ""));
+
+        if (p.kind === "cover") {
+          // 표지 그림 위에 제목을 얹습니다. 그림을 받기 전이나 실패하면 기본 표지를 씁니다.
+          const fb = el("div", "cover-fallback");
+          fb.append(el("div", "big", B.title || "수빈이에게"), el("p", "muted", B.subtitle || ""));
+          page.append(fb);
+          loadImage(B.assets && B.assets.cover).then((url) => {
+            if (!url || pages[i] !== p) return;
+            const img = new Image();
+            img.alt = "표지";
+            img.onload = () => {
+              const art = el("div", "cover-art");
+              const t = el("div", "cover-title");
+              t.append(el("div", "big", B.title || "수빈이에게"), el("div", "sm", B.subtitle || ""));
+              art.append(img, t);
+              page.style.minHeight = "0";
+              page.style.background = "#fbf7f2";
+              page.replaceChildren(art);
+            };
+            img.src = url;
+          });
+        } else if (p.kind === "end") {
+          page.style.textAlign = "center";
+          page.style.padding = "36px 20px 44px";
+          const m = new Image();
+          m.className = "mascot";
+          m.alt = "";
+          m.hidden = true;
+          m.style.height = "280px";
+          m.onload = () => (m.hidden = false);
+          loadImage(B.assets && B.assets.mascot).then((url) => { if (url) m.src = url; });
+          const h = el("h2", "serif", (B.closing && B.closing.title) || "");
+          h.style.fontSize = "clamp(20px, 5.8vw, 30px)"; // 좁은 화면에서 한 글자만 다음 줄로 넘어가지 않게 합니다
+          h.style.wordBreak = "keep-all";
+          const s = el("p", "muted", (B.closing && B.closing.sub) || "");
+          s.style.whiteSpace = "pre-line";   // 마지막 문구는 줄을 나눠 읽히게 합니다
+          s.style.wordBreak = "keep-all";
+          s.style.lineHeight = "1.9";
+          page.append(m, h, s);
+        } else {
+          let holder = null;
+          if (p.e.live) {
+            // 서버에서 받은 새 글: 그림은 데이터 주소로 받아 옵니다.
+            holder = el("div", "muted", "그림 불러오는 중…");
+            holder.style.cssText = "aspect-ratio:4/3;display:grid;place-items:center;border:1px solid var(--line);border-radius:8px;background:#fff";
+            page.append(holder);
+            API.loadImages([p.e]).then(() => {
+              if (!holder.isConnected) return;
+              const data = API.imageOf(p.e.id);
+              if (!data) { holder.remove(); return; }
+              const im = new Image();
+              im.className = "draw";
+              im.alt = p.e.name + "의 그림";
+              im.src = data;
+              holder.replaceWith(im);
+            }).catch(() => { if (holder.isConnected) holder.textContent = "그림을 불러오지 못했어요"; });
+          } else if (p.e.image) {
+            holder = el("div", "muted", "그림 불러오는 중…");
+            holder.style.cssText = "aspect-ratio:4/3;display:grid;place-items:center;border:1px solid var(--line);border-radius:8px;background:#fff";
+            page.append(holder);
+            loadImage(p.e.image).then((url) => {
+              if (!holder.isConnected) return;
+              if (!url) { holder.textContent = "그림을 불러오지 못했어요"; return; }
+              const im = new Image();
+              im.className = "draw";
+              im.alt = p.e.name + "의 그림";
+              im.src = url;
+              holder.replaceWith(im);
+            });
+          }
+          if (p.e.message) page.append(el("div", "msg", p.e.message));
+          page.append(el("div", "by", "- " + p.e.name));
+        }
+
+        root.replaceChildren(page);
+        prev.disabled = i === 0;
+        next.disabled = i === pages.length - 1;
+        count.textContent = i === 0 ? "표지" : i === pages.length - 1 ? "끝" : i + " / " + (pages.length - 2);
+      }
+
+      function go(d) {
+        const n = Math.min(pages.length - 1, Math.max(0, i + d));
+        if (n !== i) { i = n; show(); }
+      }
+      prev.addEventListener("click", () => go(-1));
+      next.addEventListener("click", () => go(1));
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight") go(1);
+        if (e.key === "ArrowLeft") go(-1);
+      });
+      let x0 = null;
+      document.addEventListener("touchstart", (e) => (x0 = e.touches[0].clientX), { passive: true });
+      document.addEventListener("touchend", (e) => {
+        if (x0 === null) return;
+        const dx = e.changedTouches[0].clientX - x0;
+        if (Math.abs(dx) > 50) go(dx < 0 ? 1 : -1);
+        x0 = null;
+      });
+
+      show();
+      first = false;
+      syncLive();
+      setInterval(syncLive, 5000);
+      // 보고 있는 장 다음의 그림들을 순서대로 미리 받아 둡니다(휴대폰 회선을 한꺼번에 채우지 않도록 하나씩).
+      (async function preload() {
+        const specs = [B.assets && B.assets.mascot, ...B.entries.map((e) => e.image)].filter(Boolean);
+        for (const s of specs) await loadImage(s);
+      })();
+    })();
+  </script>
+</body>
+</html>
